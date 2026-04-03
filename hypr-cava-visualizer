@@ -1,0 +1,39 @@
+#!/bin/sh
+# Wrapper that sets LD_PRELOAD for gtk4-layer-shell and launches the visualizer.
+# Installed by `make install` alongside the Python script.
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Find libgtk4-layer-shell
+find_layer_shell() {
+    # Check if already loadable without preload
+    if python3 -c "import gi; gi.require_version('Gtk4LayerShell', '1.0')" 2>/dev/null; then
+        return 0
+    fi
+
+    # Search common paths
+    for path in \
+        /usr/lib64/libgtk4-layer-shell.so.0 \
+        /usr/lib/libgtk4-layer-shell.so.0 \
+        /usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0 \
+        /usr/lib/aarch64-linux-gnu/libgtk4-layer-shell.so.0 \
+        /usr/local/lib64/libgtk4-layer-shell.so.0 \
+        /usr/local/lib/libgtk4-layer-shell.so.0; do
+        if [ -f "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+
+    # Try ldconfig
+    ldconfig -p 2>/dev/null | grep -o '/[^ ]*libgtk4-layer-shell.so.0' | head -1
+}
+
+if [ -z "$LD_PRELOAD" ] || ! echo "$LD_PRELOAD" | grep -q "libgtk4-layer-shell"; then
+    LIB="$(find_layer_shell)"
+    if [ -n "$LIB" ]; then
+        export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$LIB"
+    fi
+fi
+
+exec python3 "$SCRIPT_DIR/hypr-cava-visualizer.py" "$@"
