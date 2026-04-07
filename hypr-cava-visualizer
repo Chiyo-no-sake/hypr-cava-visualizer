@@ -4,10 +4,26 @@
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
+# Find a Python 3 interpreter that has the required GTK/Cairo system packages.
+# Version managers (asdf, pyenv) often shadow /usr/bin/python3 with an interpreter
+# that cannot see system site-packages, so we prefer the system python.
+find_python() {
+    for py in /usr/bin/python3 python3; do
+        if command -v "$py" >/dev/null 2>&1 && \
+           "$py" -c "import gi, cairo" 2>/dev/null; then
+            echo "$py"
+            return
+        fi
+    done
+    echo "python3"
+}
+
+PYTHON="$(find_python)"
+
 # Find libgtk4-layer-shell
 find_layer_shell() {
     # Check if already loadable without preload
-    if python3 -c "import gi; gi.require_version('Gtk4LayerShell', '1.0')" 2>/dev/null; then
+    if "$PYTHON" -c "import gi; gi.require_version('Gtk4LayerShell', '1.0')" 2>/dev/null; then
         return 0
     fi
 
@@ -36,4 +52,4 @@ if [ -z "$LD_PRELOAD" ] || ! echo "$LD_PRELOAD" | grep -q "libgtk4-layer-shell";
     fi
 fi
 
-exec python3 "$SCRIPT_DIR/hypr-cava-visualizer.py" "$@"
+exec "$PYTHON" "$SCRIPT_DIR/hypr-cava-visualizer.py" "$@"
