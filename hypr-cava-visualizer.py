@@ -182,11 +182,26 @@ def load_colors():
 
 
 fg_primary, fg_secondary, fg_tertiary = load_colors()
+# Pre-computed boosted colors (updated on color reload)
+_boosted_primary = _boosted_secondary = _boosted_tertiary = (0, 0, 0)
+
+
+def _recompute_boosted():
+    global _boosted_primary, _boosted_secondary, _boosted_tertiary
+    amt = args.boost_saturation
+    if amt > 0:
+        _boosted_primary = boost_saturation(fg_primary, amt)
+        _boosted_secondary = boost_saturation(fg_secondary, amt)
+        _boosted_tertiary = boost_saturation(fg_tertiary, amt)
 
 
 def reload_colors():
     global fg_primary, fg_secondary, fg_tertiary
     fg_primary, fg_secondary, fg_tertiary = load_colors()
+    _recompute_boosted()
+
+
+_recompute_boosted()
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +257,8 @@ def apply_power_scaling(refresh_rate):
     if not args.power_aware:
         return max(30, refresh_rate // 2)
     profile = detect_power_profile()
-    caps = {"power-saver": 0.20, "balanced": 0.33, "performance": 0.50}
-    ratio = caps.get(profile, 0.50)
-    return max(30, min(int(refresh_rate * ratio), refresh_rate))
+    caps = {"power-saver": 30, "balanced": 45, "performance": 60}
+    return caps.get(profile, 60)
 
 
 if args.framerate <= 0:
@@ -261,6 +275,11 @@ _gradient_phase = 0.0
 _last_draw_time = 0.0
 _win_opacity = 0.0 if args.fade else 1.0
 _cava_dirty = False
+_data_frame = False  # True when the current draw was triggered by new cava data
+# Cached curve points — reused during fade-only frames to skip bezier recomputation
+_cached_points_top = None
+_cached_points_bot = None
+_points_valid = False
 
 
 # ---------------------------------------------------------------------------
@@ -333,18 +352,28 @@ def draw_func(_area, cr, width, height):
 
     cr.set_operator(cairo.OPERATOR_OVER)
 
-    step = width / max(1, n - 1)
-    points_top = []
-    points_bot = []
-    for i, val in enumerate(bar_values):
-        x = i * step
-        h = val * max_h * 0.5
-        if args.mirror:
-            points_top.append((x, center_y - h))
-            points_bot.append((x, center_y + h))
-        else:
-            points_top.append((x, center_y + max_h * 0.5 - h * 2))
-            points_bot.append((x, center_y + max_h * 0.5))
+    global _cached_points_top, _cached_points_bot, _points_valid
+
+    # Reuse cached curve points during fade-only frames (no new cava data)
+    if _points_valid and _cached_points_top is not None and not _data_frame:
+        points_top = _cached_points_top
+        points_bot = _cached_points_bot
+    else:
+        step = width / max(1, n - 1)
+        points_top = []
+        points_bot = []
+        for i, val in enumerate(bar_values):
+            x = i * step
+            h = val * max_h * 0.5
+            if args.mirror:
+                points_top.append((x, center_y - h))
+                points_bot.append((x, center_y + h))
+            else:
+                points_top.append((x, center_y + max_h * 0.5 - h * 2))
+                points_bot.append((x, center_y + max_h * 0.5))
+        _cached_points_top = points_top
+        _cached_points_bot = points_bot
+        _points_valid = True
 
     # 3-color sliding gradient
     span = width * 1.5
@@ -368,13 +397,13 @@ def draw_func(_area, cr, width, height):
     line_gradient.add_color_stop_rgba(1.00, *fg_primary, lo)
     line_gradient.set_extend(cairo.Extend.REPEAT)
 
-    # Saturation boost near center
+    # Saturation boost near center (uses pre-computed boosted colors)
     boost_amt = args.boost_saturation
     if boost_amt > 0:
         boost_h = max_h * 0.25
-        bp = boost_saturation(fg_primary, boost_amt)
-        bs = boost_saturation(fg_secondary, boost_amt)
-        bt = boost_saturation(fg_tertiary, boost_amt)
+        bp = _boosted_primary
+        bs = _boosted_secondary
+        bt = _boosted_tertiary
 
         def make_gradient(y_from_center):
             dist = abs(y_from_center) / max(1, boost_h)
@@ -581,18 +610,24 @@ def on_activate(app):
 
     win.present()
 
-    # Unified frame tick — redraws on new data or during fade transitions
-    frame_interval = max(8, 1000 // args.framerate)
+    # Vblank-synced frame tick — fires once per compositor frame via the
+    # frame clock, eliminating timer drift that causes perceived lag.
+    _frame_skip = max(1, round(detect_refresh_rate() / args.framerate))
+    _frame_counter = [0]
 
-    def frame_tick():
-        global _cava_dirty
+    def frame_tick(widget, clock):
+        global _cava_dirty, _data_frame
+        _frame_counter[0] += 1
+        if _frame_counter[0] % _frame_skip != 0:
+            return True
         fading = args.fade and 0.005 < _win_opacity < 0.995
         if (_cava_dirty or fading) and drawing_area:
+            _data_frame = _cava_dirty
             _cava_dirty = False
             drawing_area.queue_draw()
         return True
 
-    GLib.timeout_add(frame_interval, frame_tick)
+    drawing_area.add_tick_callback(frame_tick)
 
     threading.Thread(target=cava_reader, daemon=True).start()
     threading.Thread(target=color_reload_watcher, daemon=True).start()
