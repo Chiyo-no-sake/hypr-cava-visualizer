@@ -4,14 +4,10 @@
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
-# Find libgtk4-layer-shell
-find_layer_shell() {
-    # Check if already loadable without preload
-    if /usr/bin/python3 -c "import gi; gi.require_version('Gtk4LayerShell', '1.0')" 2>/dev/null; then
-        return 0
-    fi
-
-    # Search common paths
+# Find libgtk4-layer-shell and set LD_PRELOAD.
+# The library must be preloaded before GTK4 initializes so that layer-shell
+# can hook into it. Having the GI typelib alone is not sufficient.
+if [ -z "$LD_PRELOAD" ] || ! echo "$LD_PRELOAD" | grep -q "libgtk4-layer-shell"; then
     for path in \
         /usr/lib64/libgtk4-layer-shell.so.0 \
         /usr/lib/libgtk4-layer-shell.so.0 \
@@ -20,19 +16,17 @@ find_layer_shell() {
         /usr/local/lib64/libgtk4-layer-shell.so.0 \
         /usr/local/lib/libgtk4-layer-shell.so.0; do
         if [ -f "$path" ]; then
-            echo "$path"
-            return 0
+            export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$path"
+            break
         fi
     done
 
-    # Try ldconfig
-    ldconfig -p 2>/dev/null | grep -o '/[^ ]*libgtk4-layer-shell.so.0' | head -1
-}
-
-if [ -z "$LD_PRELOAD" ] || ! echo "$LD_PRELOAD" | grep -q "libgtk4-layer-shell"; then
-    LIB="$(find_layer_shell)"
-    if [ -n "$LIB" ]; then
-        export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$LIB"
+    # Fallback: ask ldconfig
+    if ! echo "${LD_PRELOAD:-}" | grep -q "libgtk4-layer-shell"; then
+        LIB="$(ldconfig -p 2>/dev/null | grep -o '/[^ ]*libgtk4-layer-shell.so.0' | head -1)"
+        if [ -n "$LIB" ]; then
+            export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$LIB"
+        fi
     fi
 fi
 
