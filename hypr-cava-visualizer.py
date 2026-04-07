@@ -63,6 +63,23 @@ _parser.add_argument("--colors-file", type=str, default=None,
                       help="Path to Hyprland-format colors file (overrides --color-* flags)")
 _parser.add_argument("--cava-config-dir", type=str, default=None,
                       help="Directory for generated cava config (default: $XDG_RUNTIME_DIR or /tmp)")
+# Fade
+_parser.add_argument("--fade", action="store_true", default=False,
+                      help="Fade in/out on silence (default: off)")
+_parser.add_argument("--no-fade", action="store_true", help="Disable fade (explicit)")
+_parser.add_argument("--fade-in-speed", type=float, default=3.0,
+                      help="Fade-in speed in opacity units/sec (default: 3.0)")
+_parser.add_argument("--fade-out-speed", type=float, default=1.5,
+                      help="Fade-out speed in opacity units/sec (default: 1.5)")
+_parser.add_argument("--silence-threshold", type=float, default=0.02,
+                      help="Peak level below which audio is considered silent (default: 0.02)")
+# Saturation boost
+_parser.add_argument("--boost-saturation", type=float, default=0.35,
+                      help="Saturation boost at center, 0 to disable (default: 0.35)")
+# Power-aware framerate
+_parser.add_argument("--power-aware", action="store_true", default=False,
+                      help="Scale framerate by power profile (default: off)")
+_parser.add_argument("--no-power-aware", action="store_true", help="Disable power-aware scaling (explicit)")
 
 args = _parser.parse_args()
 
@@ -70,6 +87,8 @@ if args.no_mirror:
     args.mirror = False
 if args.no_monstercat:
     args.monstercat = False
+if args.no_fade:
+    args.fade = False
 
 # ---------------------------------------------------------------------------
 # Color helpers
@@ -220,9 +239,11 @@ def detect_power_profile():
 
 def apply_power_scaling(refresh_rate):
     """Cap framerate based on power profile, scaled to monitor refresh rate."""
+    if not args.power_aware:
+        return max(30, refresh_rate // 2)
     profile = detect_power_profile()
-    caps = {"power-saver": 0.45, "balanced": 0.65}
-    ratio = caps.get(profile, 0.90)
+    caps = {"power-saver": 0.20, "balanced": 0.33, "performance": 0.50}
+    ratio = caps.get(profile, 0.50)
     return max(30, min(int(refresh_rate * ratio), refresh_rate))
 
 
@@ -237,6 +258,9 @@ bar_values = [0.0] * args.bars
 win = None
 drawing_area = None
 _gradient_phase = 0.0
+_last_draw_time = 0.0
+_win_opacity = 0.0 if args.fade else 1.0
+_cava_dirty = False
 
 
 # ---------------------------------------------------------------------------
@@ -265,16 +289,47 @@ def smooth_curve(cr, points):
 
 
 def draw_func(_area, cr, width, height):
-    cr.set_operator(cairo.OPERATOR_SOURCE)
-    cr.set_source_rgba(0, 0, 0, 0)
-    cr.paint()
+    global _gradient_phase, _last_draw_time, _win_opacity
+
+    now = time.monotonic()
+    dt = now - _last_draw_time if _last_draw_time > 0 else 0
+    _last_draw_time = now
+    _gradient_phase = (_gradient_phase + args.gradient_speed * dt) % 1.0
+
+    # Fade window based on audio level
+    if args.fade:
+        peak = max(bar_values) if bar_values else 0.0
+        if peak > args.silence_threshold:
+            _win_opacity = min(1.0, _win_opacity + args.fade_in_speed * dt)
+        else:
+            _win_opacity = max(0.0, _win_opacity - args.fade_out_speed * dt)
+
+        if _win_opacity < 0.005:
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.paint()
+            return
 
     n = len(bar_values)
     if n == 0:
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
         return
 
     max_h = height * (args.height_pct / 100)
     center_y = height / 2
+
+    # Clip + clear only the band where bars can appear
+    band_top = center_y - max_h * 0.5 - 4
+    band_bot = center_y + max_h * 0.5 + 4
+    cr.save()
+    cr.rectangle(0, band_top, width, band_bot - band_top)
+    cr.clip()
+
+    cr.set_operator(cairo.OPERATOR_SOURCE)
+    cr.set_source_rgba(0, 0, 0, 0)
+    cr.paint()
 
     cr.set_operator(cairo.OPERATOR_OVER)
 
@@ -291,22 +346,21 @@ def draw_func(_area, cr, width, height):
             points_top.append((x, center_y + max_h * 0.5 - h * 2))
             points_bot.append((x, center_y + max_h * 0.5))
 
-    # Animated gradient position
-    p = _gradient_phase
+    # 3-color sliding gradient
     span = width * 1.5
-    gx0 = -span + p * span
+    gx0 = -span + _gradient_phase * span
     gx1 = gx0 + span
 
-    # Fill gradient
+    oa = args.opacity * _win_opacity
+
     gradient = cairo.LinearGradient(gx0, 0, gx1, 0)
-    gradient.add_color_stop_rgba(0.00, *fg_primary, args.opacity)
-    gradient.add_color_stop_rgba(0.33, *fg_secondary, args.opacity)
-    gradient.add_color_stop_rgba(0.66, *fg_tertiary, args.opacity)
-    gradient.add_color_stop_rgba(1.00, *fg_primary, args.opacity)
+    gradient.add_color_stop_rgba(0.00, *fg_primary, oa)
+    gradient.add_color_stop_rgba(0.33, *fg_secondary, oa)
+    gradient.add_color_stop_rgba(0.66, *fg_tertiary, oa)
+    gradient.add_color_stop_rgba(1.00, *fg_primary, oa)
     gradient.set_extend(cairo.Extend.REPEAT)
 
-    # Line gradient (brighter)
-    lo = min(1.0, args.opacity * 2)
+    lo = min(1.0, args.opacity * 2) * _win_opacity
     line_gradient = cairo.LinearGradient(gx0, 0, gx1, 0)
     line_gradient.add_color_stop_rgba(0.00, *fg_primary, lo)
     line_gradient.add_color_stop_rgba(0.33, *fg_secondary, lo)
@@ -314,73 +368,67 @@ def draw_func(_area, cr, width, height):
     line_gradient.add_color_stop_rgba(1.00, *fg_primary, lo)
     line_gradient.set_extend(cairo.Extend.REPEAT)
 
-    # Top curve fill
+    # Saturation boost near center
+    boost_amt = args.boost_saturation
+    if boost_amt > 0:
+        boost_h = max_h * 0.25
+        bp = boost_saturation(fg_primary, boost_amt)
+        bs = boost_saturation(fg_secondary, boost_amt)
+        bt = boost_saturation(fg_tertiary, boost_amt)
+
+        def make_gradient(y_from_center):
+            dist = abs(y_from_center) / max(1, boost_h)
+            if dist >= 1.0:
+                return gradient
+            t = 1.0 - dist
+            o = (args.opacity + (args.opacity * 0.5) * t) * _win_opacity
+            g = cairo.LinearGradient(gx0, 0, gx1, 0)
+            g.add_color_stop_rgba(0.00, *interpolate_color(fg_primary, bp, t), o)
+            g.add_color_stop_rgba(0.33, *interpolate_color(fg_secondary, bs, t), o)
+            g.add_color_stop_rgba(0.66, *interpolate_color(fg_tertiary, bt, t), o)
+            g.add_color_stop_rgba(1.00, *interpolate_color(fg_primary, bp, t), o)
+            g.set_extend(cairo.Extend.REPEAT)
+            return g
+
+        fill_top = make_gradient(-max_h * 0.15)
+        fill_bot = make_gradient(max_h * 0.15)
+    else:
+        fill_top = gradient
+        fill_bot = gradient
+
+    # Top half
     cr.new_path()
     smooth_curve(cr, points_top)
+    stroke_top = cr.copy_path()
     cr.line_to(width, center_y)
     cr.line_to(0, center_y)
     cr.close_path()
-    cr.set_source(gradient)
+    cr.set_source(fill_top)
     cr.fill()
 
-    # Top curve stroke
     cr.new_path()
-    smooth_curve(cr, points_top)
+    cr.append_path(stroke_top)
     cr.set_source(line_gradient)
     cr.set_line_width(2)
     cr.stroke()
 
-    # Mirror: bottom curve
+    # Mirror: bottom half
     if args.mirror:
         cr.new_path()
         smooth_curve(cr, points_bot)
+        stroke_bot = cr.copy_path()
         cr.line_to(width, center_y)
         cr.line_to(0, center_y)
         cr.close_path()
-        cr.set_source(gradient)
+        cr.set_source(fill_bot)
         cr.fill()
 
         cr.new_path()
-        smooth_curve(cr, points_bot)
+        cr.append_path(stroke_bot)
         cr.set_source(line_gradient)
         cr.set_line_width(2)
         cr.stroke()
 
-    # Saturation-boosted center glow
-    boost_h = max_h * 0.25
-    bp = boost_saturation(fg_primary, 0.35)
-    bs = boost_saturation(fg_secondary, 0.35)
-    bt = boost_saturation(fg_tertiary, 0.35)
-    boost_opacity = min(1.0, args.opacity * 1.4)
-
-    boost_grad = cairo.LinearGradient(gx0, 0, gx1, 0)
-    boost_grad.add_color_stop_rgba(0.00, *bp, boost_opacity)
-    boost_grad.add_color_stop_rgba(0.33, *bs, boost_opacity)
-    boost_grad.add_color_stop_rgba(0.66, *bt, boost_opacity)
-    boost_grad.add_color_stop_rgba(1.00, *bp, boost_opacity)
-    boost_grad.set_extend(cairo.Extend.REPEAT)
-
-    fade = cairo.LinearGradient(0, center_y - boost_h, 0, center_y + boost_h)
-    fade.add_color_stop_rgba(0.0, 0, 0, 0, 0)
-    fade.add_color_stop_rgba(0.4, 0, 0, 0, 1)
-    fade.add_color_stop_rgba(0.5, 0, 0, 0, 1)
-    fade.add_color_stop_rgba(0.6, 0, 0, 0, 1)
-    fade.add_color_stop_rgba(1.0, 0, 0, 0, 0)
-
-    cr.save()
-    cr.new_path()
-    smooth_curve(cr, points_top)
-    cr.line_to(width, center_y)
-    cr.line_to(0, center_y)
-    cr.close_path()
-    if args.mirror:
-        smooth_curve(cr, points_bot)
-        cr.line_to(width, center_y)
-        cr.line_to(0, center_y)
-        cr.close_path()
-    cr.clip()
-    cr.set_source(boost_grad)
-    cr.mask(fade)
     cr.restore()
 
 
@@ -424,7 +472,7 @@ _cava_proc = None
 
 def cava_reader():
     """Read cava output in a background thread and update bar_values."""
-    global bar_values, _cava_proc
+    global bar_values, _cava_proc, _cava_dirty
     config_path = build_cava_config()
     proc = subprocess.Popen(
         ["cava", "-p", config_path],
@@ -438,6 +486,7 @@ def cava_reader():
         buf = b""
         while True:
             select.select([fd], [], [])
+            # Drain all available data, keep only the last complete line
             while True:
                 try:
                     chunk = os.read(fd, 65536)
@@ -459,7 +508,7 @@ def cava_reader():
                 bar_values = [min(1.0, int(v) / 1000) for v in vals if v]
             except ValueError:
                 continue
-            GLib.idle_add(queue_draw)
+            _cava_dirty = True
     except Exception:
         pass
     finally:
@@ -474,12 +523,6 @@ def _cleanup_cava():
 
 
 atexit.register(_cleanup_cava)
-
-
-def queue_draw():
-    if drawing_area:
-        drawing_area.queue_draw()
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -538,14 +581,18 @@ def on_activate(app):
 
     win.present()
 
-    def tick_gradient():
-        global _gradient_phase
-        _gradient_phase = (_gradient_phase + args.gradient_speed / 60) % 1.0
-        if drawing_area:
+    # Unified frame tick — redraws on new data or during fade transitions
+    frame_interval = max(8, 1000 // args.framerate)
+
+    def frame_tick():
+        global _cava_dirty
+        fading = args.fade and 0.005 < _win_opacity < 0.995
+        if (_cava_dirty or fading) and drawing_area:
+            _cava_dirty = False
             drawing_area.queue_draw()
         return True
 
-    GLib.timeout_add(16, tick_gradient)
+    GLib.timeout_add(frame_interval, frame_tick)
 
     threading.Thread(target=cava_reader, daemon=True).start()
     threading.Thread(target=color_reload_watcher, daemon=True).start()
